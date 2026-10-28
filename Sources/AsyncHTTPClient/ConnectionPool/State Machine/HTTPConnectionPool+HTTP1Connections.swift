@@ -147,10 +147,12 @@ extension HTTPConnectionPool {
             }
         }
 
-        mutating func release() {
+        /// - Parameter additionalUses: Requests that ran on the connection during this lease in addition to the
+        ///   first one. This is non-zero for connections pinned by an `HTTPClientExchange`.
+        mutating func release(additionalUses: Int = 0) {
             switch self.state {
             case .leased(let connection, let remainingUses):
-                self.state = .idle(connection, since: .now(), remainingUses: remainingUses)
+                self.state = .idle(connection, since: .now(), remainingUses: remainingUses.map { $0 - additionalUses })
             case .backingOff, .starting, .idle, .closed:
                 preconditionFailure("Invalid state: \(self.state)")
             }
@@ -497,12 +499,15 @@ extension HTTPConnectionPool {
         /// - Returns: An index and an IdleConnectionContext to determine the next action for the now idle connection.
         ///            Call ``leaseConnection(at:)`` or ``closeConnection(at:)`` with the supplied index after
         ///            this. If you want to park the connection no further call is required.
-        mutating func releaseConnection(_ connectionID: Connection.ID) -> (Int, IdleConnectionContext) {
+        mutating func releaseConnection(
+            _ connectionID: Connection.ID,
+            additionalUses: Int = 0
+        ) -> (Int, IdleConnectionContext) {
             guard let index = self.connections.firstIndex(where: { $0.connectionID == connectionID }) else {
                 preconditionFailure("A connection that we don't know was released? Something is very wrong...")
             }
 
-            self.connections[index].release()
+            self.connections[index].release(additionalUses: additionalUses)
             let context = self.generateIdleConnectionContextForConnection(at: index)
             return (index, context)
         }

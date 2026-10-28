@@ -289,6 +289,21 @@ let secureSocketPathBasedURL = URL(
 )
 ```
 
+### Authentication
+Requests sent with the Swift Concurrency API are authenticated by an `HTTPClientAuthenticator`. Set one for all
+requests with `HTTPClient.Configuration.authenticator`, for a single request with `HTTPClientRequest.authenticator`,
+or for an HTTP proxy with `HTTPClient.Configuration.Proxy.authenticator`:
+```swift
+var request = HTTPClientRequest(url: "https://example.com/protected")
+request.authenticator = BasicAuthenticator(username: "alice", password: "s3cret")
+let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
+```
+
+`BasicAuthenticator` and `BearerAuthenticator` are part of AsyncHTTPClient. The `AsyncHTTPClientAuth` library adds
+`DigestAuthenticator`, `NTLMAuthenticator`, `NegotiateAuthenticator` (Kerberos), `SCRAMAuthenticator` and
+`AWSSignatureV4Authenticator`. On Linux, `NegotiateAuthenticator` needs the `GSSAPI` package trait and the MIT Kerberos development
+headers.
+
 ### Disabling HTTP/2
 The exclusive use of HTTP/1 is possible by setting `httpVersion` to `.http1Only` on `HTTPClient.Configuration`:
 ```swift

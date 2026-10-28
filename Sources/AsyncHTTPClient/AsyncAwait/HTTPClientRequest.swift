@@ -60,6 +60,12 @@ public struct HTTPClientRequest: Sendable {
     /// Defaults to `nil` (use client configuration default).
     public var localAddress: String?
 
+    /// The authenticator for this request. Overrides ``HTTPClient/Configuration/authenticator``.
+    ///
+    /// The authenticator is only used for the request's origin. It is dropped if the request is redirected to
+    /// another origin.
+    public var authenticator: (any HTTPClientAuthenticator)?
+
     public init(url: String) {
         self.url = url
         self.method = .GET
@@ -67,6 +73,7 @@ public struct HTTPClientRequest: Sendable {
         self.body = .none
         self.tlsConfiguration = nil
         self.localAddress = nil
+        self.authenticator = nil
     }
 }
 

@@ -1035,14 +1035,6 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         }
     }
 
-    func testHTTPClientAuthorization() {
-        var authorization = HTTPClient.Authorization.basic(username: "aladdin", password: "opensesame")
-        XCTAssertEqual(authorization.headerValue, "Basic YWxhZGRpbjpvcGVuc2VzYW1l")
-
-        authorization = HTTPClient.Authorization.bearer(tokens: "mF_9.B5f-4.1JqM")
-        XCTAssertEqual(authorization.headerValue, "Bearer mF_9.B5f-4.1JqM")
-    }
-
     func testProxyPlaintext() throws {
         let localHTTPBin = HTTPBin(proxy: .simulate(authorization: nil))
         let localClient = HTTPClient(
@@ -1072,52 +1064,6 @@ final class HTTPClientTests: XCTestCaseHTTPClientTestsBaseClass {
         }
         let res = try localClient.get(url: "https://test/ok").wait()
         XCTAssertEqual(res.status, .ok)
-    }
-
-    func testProxyPlaintextWithCorrectlyAuthorization() throws {
-        let localHTTPBin = HTTPBin(proxy: .simulate(authorization: "Basic YWxhZGRpbjpvcGVuc2VzYW1l"))
-        let localClient = HTTPClient(
-            eventLoopGroupProvider: .shared(self.clientGroup),
-            configuration: .init(
-                proxy: .server(
-                    host: "localhost",
-                    port: localHTTPBin.port,
-                    authorization: .basic(username: "aladdin", password: "opensesame")
-                )
-            )
-        )
-        defer {
-            XCTAssertNoThrow(try localClient.syncShutdown())
-            XCTAssertNoThrow(try localHTTPBin.shutdown())
-        }
-        let res = try localClient.get(url: "http://test/ok").wait()
-        XCTAssertEqual(res.status, .ok)
-    }
-
-    func testProxyPlaintextWithIncorrectlyAuthorization() throws {
-        let localHTTPBin = HTTPBin(proxy: .simulate(authorization: "Basic YWxhZGRpbjpvcGVuc2VzYW1l"))
-        let localClient = HTTPClient(
-            eventLoopGroupProvider: .shared(self.clientGroup),
-            configuration: .init(
-                proxy: .server(
-                    host: "localhost",
-                    port: localHTTPBin.port,
-                    authorization: .basic(
-                        username: "aladdin",
-                        password: "opensesamefoo"
-                    )
-                )
-            ).enableFastFailureModeForTesting()
-        )
-        defer {
-            XCTAssertNoThrow(try localClient.syncShutdown())
-            XCTAssertNoThrow(try localHTTPBin.shutdown())
-        }
-        XCTAssertThrowsError(try localClient.get(url: "http://test/ok").wait(), "Should fail") { error in
-            guard case let error = error as? HTTPClientError, error == .proxyAuthenticationRequired else {
-                return XCTFail("Should fail with HTTPClientError.proxyAuthenticationRequired")
-            }
-        }
     }
 
     func testUploadStreaming() throws {

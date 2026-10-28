@@ -104,18 +104,38 @@ extension HTTPClient {
                     tracing: self.configuration.tracing
                 )
             let response = try await {
-                var response = try await self.executeCancellable(preparedRequest, deadline: deadline, logger: logger)
+                var response: HTTPClientResponse
+                if let authenticator = currentRequest.authenticator ?? self.configuration.authenticator {
+                    let exchange = OriginExchange(
+                        client: self,
+                        prepared: preparedRequest,
+                        deadline: deadline,
+                        logger: logger
+                    )
+                    do {
+                        response = try await authenticator.authenticate(
+                            currentRequest,
+                            exchange: HTTPClientExchange(backing: exchange)
+                        )
+                    } catch {
+                        exchange.finish(returning: nil)
+                        throw error
+                    }
+                    history.append(contentsOf: exchange.finish(returning: response))
+                } else {
+                    response = try await self.executeCancellable(preparedRequest, deadline: deadline, logger: logger)
 
-                history.append(
-                    .init(
-                        request: currentRequest,
-                        responseHead: .init(
-                            version: response.version,
-                            status: response.status,
-                            headers: response.headers
+                    history.append(
+                        .init(
+                            request: currentRequest,
+                            responseHead: .init(
+                                version: response.version,
+                                status: response.status,
+                                headers: response.headers
+                            )
                         )
                     )
-                )
+                }
 
                 response.history = history
 
@@ -160,10 +180,14 @@ extension HTTPClient {
 
     /// - warning: This method may violates Structured Concurrency because it returns a `HTTPClientResponse` that needs to be
     ///            streamed by the user. This means the request, the connection and other resources are still alive when the request returns.
-    private func executeCancellable(
+    ///
+    /// - Parameter submit: Hands the transaction to the connection pool. Defaults to the pool manager, which picks a
+    ///   connection pool by the request's pool key.
+    func executeCancellable(
         _ request: HTTPClientRequest.Prepared,
         deadline: NIODeadline,
-        logger: Logger
+        logger: Logger,
+        submit: ((Transaction) -> Void)? = nil
     ) async throws -> HTTPClientResponse {
         let cancelHandler = TransactionCancelHandler()
 
@@ -189,7 +213,11 @@ extension HTTPClient {
 
                     cancelHandler.registerTransaction(transaction)
 
-                    self.poolManager.executeRequest(transaction)
+                    if let submit {
+                        submit(transaction)
+                    } else {
+                        self.poolManager.executeRequest(transaction)
+                    }
                 }
             },
             onCancel: {

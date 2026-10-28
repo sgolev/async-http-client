@@ -45,8 +45,11 @@ extension Transaction {
         fileprivate enum ResponseStreamState: Sendable {
             // Waiting for response head. Valid transitions to: streamingBody.
             case waitingForResponseHead
-            // streaming response body. Valid transitions to: finished.
+            // streaming response body. Valid transitions to: discardingBody, finished.
             case streamingBody(TransactionBody.Source)
+            // The response body is no longer of interest and is read and dropped, so that the connection
+            // can be reused. Used by `HTTPClientExchange`. Valid transitions to: finished.
+            case discardingBody(remainingBudget: Int)
             case finished(HTTPHeaders?)
         }
 
@@ -162,8 +165,10 @@ extension Transaction {
                     return .failResponseStream(source, error, context.executor, bodyStreamContinuation: nil)
                 }
 
-            case .executing(let context, let requestStreamState, .finished):
-                // an error occured after full response received, but before the full request was sent
+            case .executing(let context, let requestStreamState, .finished),
+                .executing(let context, let requestStreamState, .discardingBody):
+                // an error occured after full response received (or while it was discarded), but before
+                // the full request was sent
                 self.state = .finished(.failure(error))
                 switch requestStreamState {
                 case .paused(let bodyStreamContinuation):
@@ -431,6 +436,7 @@ extension Transaction {
                 .queued,
                 .deadlineExceededWhileQueued,
                 .executing(_, _, .streamingBody),
+                .executing(_, _, .discardingBody),
                 .executing(_, _, .finished):
                 preconditionFailure("invalid state \(self.state)")
 
@@ -472,6 +478,7 @@ extension Transaction {
             case .executing(let context, _, .streamingBody):
                 return .requestMoreResponseBodyParts(context.executor)
             case .finished,
+                .executing(_, _, .discardingBody),
                 .executing(_, _, .finished):
                 return .none
             }
@@ -480,6 +487,8 @@ extension Transaction {
         enum ReceiveResponsePartAction {
             case none
             case yieldResponseBodyParts(TransactionBody.Source, CircularBuffer<ByteBuffer>, HTTPRequestExecutor)
+            case demandMoreResponseBodyParts(HTTPRequestExecutor)
+            case fail(FailAction)
         }
 
         mutating func receiveResponseBodyParts(_ buffer: CircularBuffer<ByteBuffer>) -> ReceiveResponsePartAction {
@@ -494,6 +503,15 @@ extension Transaction {
 
             case .executing(let context, _, .streamingBody(let source)):
                 return .yieldResponseBodyParts(source, buffer, context.executor)
+
+            case .executing(let context, let requestState, .discardingBody(let remainingBudget)):
+                let remainingBudget = buffer.reduce(remainingBudget) { $0 - $1.readableBytes }
+                guard remainingBudget >= 0 else {
+                    // The body is too large to be drained. Closing the connection is cheaper.
+                    return .fail(self.fail(HTTPClientError.cancelled))
+                }
+                self.state = .executing(context, requestState, .discardingBody(remainingBudget: remainingBudget))
+                return .demandMoreResponseBodyParts(context.executor)
 
             case .finished:
                 // the request failed or was cancelled before, we can ignore further data
@@ -533,6 +551,15 @@ extension Transaction {
                 }
                 return .finishResponseStream(source, finalBody: newChunks)
 
+            case .executing(let context, let requestState, .discardingBody):
+                switch requestState {
+                case .finished:
+                    self.state = .finished(.success(trailers))
+                case .paused, .producing, .requestHeadSent, .endForwarded:
+                    self.state = .executing(context, requestState, .finished(trailers))
+                }
+                return .none
+
             case .finished:
                 // the request failed or was cancelled before, we can ignore all events
                 return .none
@@ -548,6 +575,7 @@ extension Transaction {
             case .deadlineExceededWhileQueued, .initialized, .queued,
                 .executing(_, _, .waitingForResponseHead),
                 .executing(_, _, .streamingBody),
+                .executing(_, _, .discardingBody),
                 .finished(.failure):
                 return nil
             case .executing(_, _, .finished(let trailers)), .finished(.success(let trailers)):
@@ -557,10 +585,41 @@ extension Transaction {
 
         mutating func httpResponseStreamTerminated() -> FailAction {
             switch self.state {
-            case .executing(_, _, .finished), .finished:
+            case .executing(_, _, .finished), .executing(_, _, .discardingBody), .finished:
+                // If the body is discarded, we finished the stream ourselves.
                 return .none
             default:
                 return self.fail(HTTPClientError.cancelled)
+            }
+        }
+
+        enum DiscardResponseBodyAction {
+            case none
+            case finishStreamAndDemandMore(TransactionBody.Source, HTTPRequestExecutor)
+            case fail(FailAction)
+        }
+
+        /// Stops forwarding the response body to the user and drops it instead, so that the connection can be
+        /// reused once the response has been received.
+        ///
+        /// - Parameters:
+        ///   - maxBytes: If the remaining body is larger than this, the request is cancelled (and the
+        ///     connection therefore closed) instead.
+        ///   - expectedContentLength: The response's content length, if known.
+        mutating func discardResponseBody(maxBytes: Int, expectedContentLength: Int?) -> DiscardResponseBodyAction {
+            switch self.state {
+            case .executing(let context, let requestState, .streamingBody(let source)):
+                if let expectedContentLength, expectedContentLength > maxBytes {
+                    return .fail(self.fail(HTTPClientError.cancelled))
+                }
+                self.state = .executing(context, requestState, .discardingBody(remainingBudget: maxBytes))
+                return .finishStreamAndDemandMore(source, context.executor)
+
+            case .initialized, .queued, .deadlineExceededWhileQueued, .executing(_, _, .waitingForResponseHead):
+                preconditionFailure("A response body can only be discarded after the head was received")
+
+            case .executing(_, _, .discardingBody), .executing(_, _, .finished), .finished:
+                return .none
             }
         }
 

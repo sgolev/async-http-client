@@ -880,6 +880,21 @@ public final class HTTPClient: Sendable {
         public var connectionPool: ConnectionPool
         /// Upstream proxy, defaults to no proxy.
         public var proxy: Proxy?
+
+        /// Stores the ``authenticator``. The configuration has no availability restrictions, so it can't store an
+        /// existential of the protocol directly.
+        private var _authenticator: (any Sendable)?
+
+        /// The default authenticator for all requests sent with the async/await API, defaults to none.
+        ///
+        /// ``HTTPClientRequest/authenticator`` overrides it for a single request. Unlike a request's authenticator,
+        /// this authenticator is also used after a redirect to another origin. Use
+        /// ``HTTPClientExchange/peer`` to restrict credentials to the origins they are meant for.
+        @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+        public var authenticator: (any HTTPClientAuthenticator)? {
+            get { self._authenticator as? any HTTPClientAuthenticator }
+            set { self._authenticator = newValue }
+        }
         /// Enables automatic body decompression. Supported algorithms are gzip and deflate.
         public var decompression: Decompression
         /// Ignore TLS unclean shutdown error, defaults to `false`.
@@ -1525,6 +1540,9 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
         case invalidDNSOverridesConfiguration
         case invalidLocalAddress
         case invalidProxyConfiguration
+        case connectionChanged
+        case requestBodyNotReplayable
+        case invalidExchangeUse
         case internalStateFailure(file: String, line: UInt)
     }
 
@@ -1622,6 +1640,12 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
             return "Invalid local address"
         case .invalidProxyConfiguration:
             return "The proxy configuration is not valid"
+        case .connectionChanged:
+            return "The pinned connection was closed"
+        case .requestBodyNotReplayable:
+            return "The request body was already sent and cannot be sent again"
+        case .invalidExchangeUse:
+            return "The HTTPClientExchange was used incorrectly"
         case .internalStateFailure(let file, let line):
             return
                 "An internal state failure has occurred (File: \(file), line: \(line)). Please open an issue with a reproducer if possible"
@@ -1730,6 +1754,18 @@ public struct HTTPClientError: Error, Equatable, CustomStringConvertible {
 
     /// The proxy configuration is not valid.
     public static let invalidProxyConfiguration = HTTPClientError(code: .invalidProxyConfiguration)
+
+    /// The connection that an `HTTPClientExchange` pinned was closed. The request was not sent.
+    ///
+    /// Authenticators that rely on a connection-based scheme should start over, typically by pinning a new
+    /// connection.
+    public static let connectionChanged = HTTPClientError(code: .connectionChanged)
+
+    /// An `HTTPClientExchange` was asked to send a request body, that can only be sent once, a second time.
+    public static let requestBodyNotReplayable = HTTPClientError(code: .requestBodyNotReplayable)
+
+    /// An `HTTPClientExchange` was used after the authenticator returned, or for a request it cannot send.
+    public static let invalidExchangeUse = HTTPClientError(code: .invalidExchangeUse)
 
     /// A state machine has reached an unsupported state, that wasn't considered when implementing.
     public static func internalStateFailure(file: String = #fileID, line: UInt = #line) -> HTTPClientError {

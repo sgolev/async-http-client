@@ -347,8 +347,8 @@ extension HTTPConnectionPool {
             )
         }
 
-        mutating func http1ConnectionReleased(_ connectionID: Connection.ID) -> Action {
-            let (index, context) = self.connections.releaseConnection(connectionID)
+        mutating func http1ConnectionReleased(_ connectionID: Connection.ID, additionalUses: Int = 0) -> Action {
+            let (index, context) = self.connections.releaseConnection(connectionID, additionalUses: additionalUses)
             return .init(self.nextActionForIdleConnection(at: index, context: context))
         }
 

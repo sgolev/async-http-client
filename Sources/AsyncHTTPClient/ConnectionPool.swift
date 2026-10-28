@@ -50,6 +50,18 @@ enum ConnectionPool {
         private var tlsConfiguration: BestEffortHashableTLSConfiguration?
         var serverNameIndicatorOverride: String?
         var localAddress: String?
+        /// Set for pools that only serve connections pinned by an `HTTPClientExchange`. Such pools are
+        /// HTTP/1.1 only and are partitioned by the authentication identity, so that a connection that was
+        /// authenticated for one identity is never handed to a request of another identity (or to a request
+        /// that is not authenticated at all).
+        var pinning: Pinning?
+
+        enum Pinning: Hashable, Sendable {
+            /// The exchange did not specify an identity. Connections that were marked as authenticated are
+            /// closed when they are released.
+            case anonymous
+            case identity(PinIdentity)
+        }
 
         init(
             scheme: Scheme,
@@ -83,7 +95,27 @@ enum ConnectionPool {
             if let addr = self.localAddress {
                 result += " bind: \(addr)"
             }
+            if let pinning = self.pinning {
+                // The identity may contain user names. Only log a hash of it.
+                result += " pinned: \(pinning.hashValue)"
+            }
             return result
+        }
+
+        func with(pinning: Pinning?) -> Self {
+            var key = self
+            key.pinning = pinning
+            return key
+        }
+    }
+
+    /// A type erased identity that was passed to `HTTPClientExchange.pinConnection(with:)`.
+    struct PinIdentity: Hashable, @unchecked Sendable {
+        // `AnyHashable` is not `Sendable`, but we only ever store `Hashable & Sendable` values in it.
+        private let value: AnyHashable
+
+        init(_ value: some Hashable & Sendable) {
+            self.value = AnyHashable(value)
         }
     }
 }

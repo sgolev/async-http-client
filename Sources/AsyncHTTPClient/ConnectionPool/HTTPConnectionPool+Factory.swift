@@ -71,13 +71,14 @@ extension HTTPConnectionPool.ConnectionFactory {
         let promise = eventLoop.makePromise(of: NegotiatedProtocol.self)
         promise.futureResult.whenComplete { [logger] result in
             switch result {
-            case .success(.http1_1(let channel)):
+            case .success(.http1_1(let channel, let tlsInfo)):
                 do {
                     let connection = try HTTP1Connection.start(
                         channel: channel,
                         connectionID: connectionID,
                         delegate: http1ConnectionDelegate,
                         decompression: self.clientConfiguration.decompression,
+                        tlsInfo: tlsInfo,
                         logger: logger
                     )
 
@@ -161,7 +162,7 @@ extension HTTPConnectionPool.ConnectionFactory {
     }
 
     enum NegotiatedProtocol {
-        case http1_1(Channel)
+        case http1_1(Channel, tlsInfo: HTTPClient.TLSInfo?)
         case http2(Channel)
     }
 
@@ -253,7 +254,7 @@ extension HTTPConnectionPool.ConnectionFactory {
                 eventLoop: eventLoop
             )
             bootstrap.connect(target: self.key.connectionTarget).map {
-                .http1_1($0)
+                .http1_1($0, tlsInfo: nil)
             }.cascade(to: promise)
         } catch {
             promise.fail(error)
@@ -269,54 +270,131 @@ extension HTTPConnectionPool.ConnectionFactory {
         logger: Logger,
         promise: EventLoopPromise<NegotiatedProtocol>
     ) {
-        // A proxy connection starts with a plain text connection to the proxy server. After
-        // the connection has been established with the proxy server, the connection might be
-        // upgraded to TLS before we send our first request.
-        let bootstrap: NIOClientTCPBootstrapProtocol
-        do {
-            bootstrap = try self.makePlainBootstrap(
-                requester: requester,
-                connectionID: connectionID,
+        // A proxy connection starts with a plain text connection to the proxy server. After a `CONNECT`
+        // request opened a tunnel, the connection might be upgraded to TLS before we send our first request.
+        // All connections to the proxy are created on `eventLoop`, since the pool expects the connection on it.
+        let openChannel: @Sendable () -> EventLoopFuture<(Channel, NIOLoopBound<HTTP1ProxyConnectRequestHandler>)> = {
+            do {
+                let bootstrap = try self.makePlainBootstrap(
+                    requester: requester,
+                    connectionID: connectionID,
+                    deadline: deadline,
+                    eventLoop: eventLoop
+                )
+                return bootstrap.connect(host: proxy.host, port: proxy.port).flatMapThrowing { channel in
+                    let sync = channel.pipeline.syncOperations
+                    let handler = HTTP1ProxyConnectRequestHandler()
+                    try sync.addHandler(HTTPRequestEncoder())
+                    try sync.addHandler(ByteToMessageHandler(HTTPResponseDecoder(leftOverBytesStrategy: .dropBytes)))
+                    try sync.addHandler(handler)
+                    return (channel, NIOLoopBound(handler, eventLoop: channel.eventLoop))
+                }
+            } catch {
+                return eventLoop.makeFailedFuture(error)
+            }
+        }
+
+        // The status of the last `CONNECT` request, and the tunnel if the proxy accepted it.
+        let result: EventLoopFuture<(status: HTTPResponseStatus, tunnel: Channel?)>
+        if #available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *), let authenticator = proxy.authenticator {
+            result = self.authenticateWithProxy(
+                proxy,
+                authenticator: authenticator,
+                openChannel: openChannel,
                 deadline: deadline,
                 eventLoop: eventLoop
             )
-        } catch {
-            promise.fail(error)
-            return
-        }
-        bootstrap.connect(host: proxy.host, port: proxy.port).whenComplete { result in
-            switch result {
-            case .success(let channel):
-                let encoder = HTTPRequestEncoder()
-                let decoder = ByteToMessageHandler(HTTPResponseDecoder(leftOverBytesStrategy: .dropBytes))
-                let proxyHandler = HTTP1ProxyConnectHandler(
-                    target: self.key.connectionTarget,
-                    proxyAuthorization: proxy.authorization,
-                    connectHeaders: proxy.connectHeaders,
-                    deadline: deadline
-                )
-
-                do {
-                    try channel.pipeline.syncOperations.addHandler(encoder)
-                    try channel.pipeline.syncOperations.addHandler(decoder)
-                    try channel.pipeline.syncOperations.addHandler(proxyHandler)
-                } catch {
-                    return promise.fail(error)
+        } else {
+            let (host, port) = self.key.connectionTarget.proxyConnectTarget
+            let head = HTTP1ProxyConnectRequestHandler.makeConnectHead(
+                targetHost: host,
+                targetPort: port,
+                headers: HTTP1ProxyConnectRequestHandler.removingReservedHeaders(from: proxy.connectHeaders)
+            )
+            result = openChannel().flatMap { channel, handler in
+                let timeout = eventLoop.scheduleTask(deadline: deadline) { channel.close(promise: nil) }
+                return handler.value.sendConnect(head).always { _ in timeout.cancel() }.map { response in
+                    (response.head.status, (200..<300).contains(response.head.status.code) ? channel : nil)
                 }
+            }
+        }
 
-                // The proxyEstablishedFuture is set as soon as the HTTP1ProxyConnectHandler is in a
-                // pipeline. It is created in HTTP1ProxyConnectHandler's handlerAdded method.
-                return proxyHandler.proxyEstablishedFuture!.assumeIsolated().flatMap {
-                    channel.pipeline.syncOperations.removeHandler(proxyHandler).assumeIsolated().flatMap {
-                        channel.pipeline.syncOperations.removeHandler(decoder).assumeIsolated().flatMap {
-                            channel.pipeline.syncOperations.removeHandler(encoder)
-                        }.nonisolated()
-                    }.nonisolated()
+        result.flatMapErrorThrowing { error in
+            if NIODeadline.now() >= deadline {
+                throw HTTPClientError.httpProxyHandshakeTimeout
+            }
+            throw error
+        }.flatMap { status, tunnel -> EventLoopFuture<NegotiatedProtocol> in
+            guard let channel = tunnel else {
+                let error =
+                    status == .proxyAuthenticationRequired
+                    ? HTTPClientError.proxyAuthenticationRequired : HTTPClientError.invalidProxyResponse
+                return eventLoop.makeFailedFuture(error)
+            }
+            return Self.removeProxyConnectHandlers(from: channel).flatMap {
+                self.setupTLSInProxyConnectionIfNeeded(channel, deadline: deadline, logger: logger)
+            }
+        }.cascade(to: promise)
+    }
+
+    /// Lets the proxy's authenticator send the `CONNECT` requests.
+    @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
+    private func authenticateWithProxy(
+        _ proxy: HTTPClient.Configuration.Proxy,
+        authenticator: any HTTPClientAuthenticator,
+        openChannel:
+            @escaping @Sendable () -> EventLoopFuture<(Channel, NIOLoopBound<HTTP1ProxyConnectRequestHandler>)>,
+        deadline: NIODeadline,
+        eventLoop: EventLoop
+    ) -> EventLoopFuture<(status: HTTPResponseStatus, tunnel: Channel?)> {
+        let exchange = ProxyConnectExchange(
+            proxyHost: proxy.host,
+            proxyPort: proxy.port,
+            target: self.key.connectionTarget,
+            openChannel: openChannel
+        )
+        let request = exchange.makeInitialRequest(connectHeaders: proxy.connectHeaders)
+
+        let responsePromise = eventLoop.makePromise(of: HTTPClientResponse.self)
+        let task = responsePromise.completeWithTask {
+            try await authenticator.authenticate(request, exchange: HTTPClientExchange(backing: exchange))
+        }
+        let timeout = eventLoop.scheduleTask(deadline: deadline) {
+            // Fails pending `CONNECT` requests with `remoteConnectionClosed`.
+            task.cancel()
+            exchange.finish()?.close(promise: nil)
+        }
+
+        return responsePromise.futureResult.always { _ in
+            timeout.cancel()
+        }.flatMapErrorThrowing { error in
+            exchange.finish()?.close(promise: nil)
+            throw error
+        }.map { response in
+            let tunnel = exchange.finish()
+            guard (200..<300).contains(response.status.code) else {
+                // The authenticator might have returned a response it made up.
+                tunnel?.close(promise: nil)
+                return (response.status, nil)
+            }
+            return (response.status, tunnel)
+        }
+    }
+
+    private static func removeProxyConnectHandlers(from channel: Channel) -> EventLoopFuture<Void> {
+        channel.eventLoop.flatSubmit {
+            do {
+                let sync = channel.pipeline.syncOperations
+                let handler = try sync.context(handlerType: HTTP1ProxyConnectRequestHandler.self)
+                let decoder = try sync.context(handlerType: ByteToMessageHandler<HTTPResponseDecoder>.self)
+                let encoder = try sync.context(handlerType: HTTPRequestEncoder.self)
+                return sync.removeHandler(context: handler).assumeIsolated().flatMap {
+                    sync.removeHandler(context: decoder)
                 }.flatMap {
-                    self.setupTLSInProxyConnectionIfNeeded(channel, deadline: deadline, logger: logger)
-                }.nonisolated().cascade(to: promise)
-            case .failure(let error):
-                promise.fail(error)
+                    sync.removeHandler(context: encoder)
+                }.nonisolated()
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
             }
         }
     }
@@ -383,7 +461,7 @@ extension HTTPConnectionPool.ConnectionFactory {
         case .unix, .httpUnix, .httpsUnix:
             preconditionFailure("Unexpected scheme. Not supported for proxy!")
         case .http:
-            return channel.eventLoop.makeSucceededFuture(.http1_1(channel))
+            return channel.eventLoop.makeSucceededFuture(.http1_1(channel, tlsInfo: nil))
         case .https:
             var tlsConfig = self.tlsConfiguration
             switch self.clientConfiguration.httpVersion.configuration {
@@ -682,15 +760,30 @@ extension HTTPConnectionPool.ConnectionFactory {
         }
     }
 
+    /// Must be called on the channel's event loop, once the TLS handshake completed.
     private static func matchALPNToHTTPVersion(_ negotiated: String?, channel: Channel) throws -> NegotiatedProtocol {
         switch negotiated {
         case .none, .some("http/1.1"):
-            return .http1_1(channel)
+            return .http1_1(channel, tlsInfo: Self.captureTLSInfo(negotiated, channel: channel))
         case .some("h2"):
             return .http2(channel)
         case .some(let unsupported):
             throw HTTPClientError.serverOfferedUnsupportedApplicationProtocol(unsupported)
         }
+    }
+}
+
+extension HTTPConnectionPool.ConnectionFactory {
+    /// Must be called on the channel's event loop.
+    private static func captureTLSInfo(_ negotiated: String?, channel: Channel) -> HTTPClient.TLSInfo {
+        channel.eventLoop.assertInEventLoop()
+        // With NIOTransportServices, TLS is handled by Network.framework and there is no NIOSSLHandler.
+        // TODO: Read the peer certificate from `sec_protocol_metadata` in this case.
+        let sslHandler = try? channel.pipeline.syncOperations.handler(type: NIOSSLHandler.self)
+        return HTTPClient.TLSInfo(
+            negotiatedApplicationProtocol: negotiated,
+            peerCertificate: try? sslHandler?.peerCertificate?.toDERBytes()
+        )
     }
 }
 

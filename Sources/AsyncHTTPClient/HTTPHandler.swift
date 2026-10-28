@@ -371,6 +371,9 @@ extension HTTPClient {
         /// - parameters:
         ///     - username: the username to authenticate with
         ///     - password: authentication password associated with the username
+        ///
+        /// - Note: Unlike ``HTTPClientRequest``, requests of the `EventLoopFuture` based API do not support
+        ///   ``HTTPClientAuthenticator``s.
         public mutating func setBasicAuth(username: String, password: String) {
             self.headers.setBasicAuth(username: username, password: password)
         }
@@ -459,47 +462,6 @@ extension HTTPClient {
             self.headers = headers
             self.body = body
             self.history = history
-        }
-    }
-
-    /// HTTP authentication.
-    public struct Authorization: Hashable, Sendable {
-        private enum Scheme: Hashable {
-            case Basic(String)
-            case Bearer(String)
-        }
-
-        private let scheme: Scheme
-
-        private init(scheme: Scheme) {
-            self.scheme = scheme
-        }
-
-        /// HTTP basic auth.
-        public static func basic(username: String, password: String) -> HTTPClient.Authorization {
-            .basic(credentials: Base64.encode(bytes: "\(username):\(password)".utf8))
-        }
-
-        /// HTTP basic auth.
-        ///
-        /// This version uses the raw string directly.
-        public static func basic(credentials: String) -> HTTPClient.Authorization {
-            .init(scheme: .Basic(credentials))
-        }
-
-        /// HTTP bearer auth
-        public static func bearer(tokens: String) -> HTTPClient.Authorization {
-            .init(scheme: .Bearer(tokens))
-        }
-
-        /// The header string for this auth field.
-        public var headerValue: String {
-            switch self.scheme {
-            case .Basic(let credentials):
-                return "Basic \(credentials)"
-            case .Bearer(let tokens):
-                return "Bearer \(tokens)"
-            }
         }
     }
 

@@ -429,6 +429,10 @@ where
     enum Proxy {
         case none
         case simulate(authorization: String?)
+        /// Answers `CONNECT` requests without the expected `Proxy-Authorization` with a 407 that carries the
+        /// `Proxy-Authenticate` challenge and `body`. Unless `closeOnChallenge` is set, the client can retry on the same
+        /// connection.
+        case simulateChallenge(authorization: String, challenge: String, closeOnChallenge: Bool, body: String? = nil)
     }
 
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -533,11 +537,22 @@ where
                     }
 
                     // if we need to simulate a proxy, we need to add those handlers first
-                    if case .simulate(authorization: let expectedAuthorization) = proxy {
+                    switch proxy {
+                    case .none:
+                        break
+                    case .simulate(authorization: let expectedAuthorization):
                         try self.syncAddHTTPProxyHandlers(
                             to: channel,
                             connectionID: connectionID,
                             expectedAuthorization: expectedAuthorization
+                        )
+                        return channel.eventLoop.makeSucceededVoidFuture()
+                    case .simulateChallenge(let expectedAuthorization, let challenge, let closeOnChallenge, let body):
+                        try self.syncAddHTTPProxyHandlers(
+                            to: channel,
+                            connectionID: connectionID,
+                            expectedAuthorization: expectedAuthorization,
+                            challenge: (challenge, closeOnChallenge, body)
                         )
                         return channel.eventLoop.makeSucceededVoidFuture()
                     }
@@ -566,14 +581,19 @@ where
     private func syncAddHTTPProxyHandlers(
         to channel: Channel,
         connectionID: Int,
-        expectedAuthorization: String?
+        expectedAuthorization: String?,
+        challenge: (value: String, closeOnChallenge: Bool, body: String?)? = nil
     ) throws {
         let sync = channel.pipeline.syncOperations
         let promise = channel.eventLoop.makePromise(of: Void.self)
 
         let responseEncoder = HTTPResponseEncoder()
         let requestDecoder = ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes))
-        let proxySimulator = HTTPProxySimulator(promise: promise, expectedAuthorization: expectedAuthorization)
+        let proxySimulator = HTTPProxySimulator(
+            promise: promise,
+            expectedAuthorization: expectedAuthorization,
+            challenge: challenge
+        )
 
         try sync.addHandler(responseEncoder)
         try sync.addHandler(requestDecoder)
@@ -584,7 +604,15 @@ where
         }.flatMap { _ in
             channel.pipeline.syncOperations.removeHandler(responseEncoder)
         }.flatMap { _ in
-            channel.pipeline.syncOperations.removeHandler(requestDecoder)
+            // The simulator might have replaced the decoder.
+            let sync = channel.pipeline.syncOperations
+            do {
+                return sync.removeHandler(
+                    context: try sync.context(handlerType: ByteToMessageHandler<HTTPRequestDecoder>.self)
+                )
+            } catch {
+                return channel.eventLoop.makeFailedFuture(error)
+            }
         }.whenComplete { result in
             switch result {
             case .failure:
@@ -733,18 +761,26 @@ final class HTTPProxySimulator: ChannelInboundHandler, RemovableChannelHandler {
     // the promise to succeed, once the proxy connection is setup
     let promise: EventLoopPromise<Void>
     let expectedAuthorization: String?
+    let challenge: (value: String, closeOnChallenge: Bool, body: String?)?
 
     var head: HTTPResponseHead
 
-    init(promise: EventLoopPromise<Void>, expectedAuthorization: String?) {
+    init(
+        promise: EventLoopPromise<Void>,
+        expectedAuthorization: String?,
+        challenge: (value: String, closeOnChallenge: Bool, body: String?)? = nil
+    ) {
         self.promise = promise
         self.expectedAuthorization = expectedAuthorization
-        self.head = HTTPResponseHead(
-            version: .init(major: 1, minor: 1),
-            status: .ok,
-            headers: .init([("Content-Length", "0")])
-        )
+        self.challenge = challenge
+        self.head = Self.okHead
     }
+
+    private static let okHead = HTTPResponseHead(
+        version: .init(major: 1, minor: 1),
+        status: .ok,
+        headers: .init([("Content-Length", "0")])
+    )
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let request = self.unwrapInboundIn(data)
@@ -767,6 +803,35 @@ final class HTTPProxySimulator: ChannelInboundHandler, RemovableChannelHandler {
         case .body:
             ()
         case .end:
+            if let challenge = self.challenge, self.head.status == .proxyAuthenticationRequired {
+                self.head.headers.add(name: "Proxy-Authenticate", value: challenge.value)
+                // NOTE: Clients can only read the body with apple/swift-nio#3773.
+                let body = ByteBuffer(string: challenge.body ?? "")
+                self.head.headers.replaceOrAdd(name: "Content-Length", value: "\(body.readableBytes)")
+                if challenge.closeOnChallenge {
+                    self.head.headers.add(name: "Connection", value: "close")
+                } else {
+                    // Wait for the next CONNECT request on this connection. `HTTPRequestDecoder` stops decoding
+                    // after a CONNECT request, since it expects a tunnel. Replace it to decode the next request.
+                    do {
+                        let sync = context.pipeline.syncOperations
+                        let decoder = try sync.handler(type: ByteToMessageHandler<HTTPRequestDecoder>.self)
+                        sync.removeHandler(decoder, promise: nil)
+                        try sync.addHandler(
+                            ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .forwardBytes)),
+                            position: .before(self)
+                        )
+                    } catch {
+                        self.promise.fail(error)
+                        return
+                    }
+                    context.write(self.wrapOutboundOut(.head(self.head)), promise: nil)
+                    context.write(self.wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+                    context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)
+                    self.head = Self.okHead
+                    return
+                }
+            }
             let okay = self.head.status != .ok
             context.write(self.wrapOutboundOut(.head(self.head)), promise: nil)
             context.writeAndFlush(self.wrapOutboundOut(.end(nil)), promise: nil)

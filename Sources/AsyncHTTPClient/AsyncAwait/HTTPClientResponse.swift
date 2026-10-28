@@ -216,6 +216,17 @@ typealias TransactionBody = NIOThrowingAsyncSequenceProducer<
 
 @available(macOS 10.15, iOS 13.0, watchOS 6.0, tvOS 13.0, *)
 extension HTTPClientResponse.Body {
+    /// The transaction that produces the body and the expected length of the body, if the body is streamed from a
+    /// connection.
+    var transaction: (Transaction, expectedContentLength: Int?)? {
+        switch self.storage {
+        case .transaction(_, let transaction, let expectedContentLength):
+            return (transaction, expectedContentLength)
+        case .anyAsyncSequence:
+            return nil
+        }
+    }
+
     @usableFromInline enum Storage: Sendable {
         case transaction(TransactionBody, Transaction, expectedContentLength: Int?)
         case anyAsyncSequence(AnyAsyncSequence<ByteBuffer>)

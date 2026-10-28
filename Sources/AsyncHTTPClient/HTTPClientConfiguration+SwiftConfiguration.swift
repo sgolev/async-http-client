@@ -161,32 +161,66 @@ extension HTTPClient.Configuration.Proxy {
     /// - `host` (string): Proxy server host. Required when `enabled` is `true`.
     /// - `port` (int): Proxy server port. Required for `http` proxies; defaults to `1080` for `socks` proxies.
     /// - `type` (string, optional, default: "http"): Proxy type ("http" or "socks").
-    /// - `authorization` (scoped, optional): Authorization configuration read by ``HTTPClient/Authorization/init(configReader:)``.
-    ///   Only supported for `http` proxies.
+    /// - `authorization` (scoped, optional): Authorization configuration that sets ``authenticator``. Only supported for
+    ///   `http` proxies. Keys:
+    ///   - `scheme` (string, optional): Authorization scheme ("basic" or "bearer"). If absent, no authenticator is set.
+    ///   - `username` (string): Username for basic authentication. Required (alongside `password`) when `scheme` is
+    ///     "basic" and `credentials` is not set.
+    ///   - `password` (string): Password for basic authentication. Required (alongside `username`) when `scheme` is
+    ///     "basic" and `credentials` is not set.
+    ///   - `credentials` (string): Pre-encoded basic credentials. Used when `scheme` is "basic" and
+    ///     `username`/`password` are not both provided.
+    ///   - `token` (string): Bearer token. Required when `scheme` is "bearer".
     /// - `connectHeaders` (string array, optional): Extra headers sent only on the `CONNECT` request to the proxy.
     ///   Each entry is a colon-separated `Name: value` pair (e.g., "X-Foo: bar"). Only supported for `http` proxies.
     ///
     /// - Throws: `HTTPClientError.invalidProxyConfiguration` if `enabled` is `true` but `host` is missing, `type` is unknown,
     ///   `port` is missing for an HTTP proxy, `authorization` or `connectHeaders` is specified for a SOCKS proxy,
-    ///   a `connectHeaders` entry is malformed, or `authorization` is invalid (see ``HTTPClient/Authorization/init(configReader:)``)
+    ///   a `connectHeaders` entry is malformed, or `authorization` is invalid
     public init?(configReader: ConfigReader) throws {
         guard configReader.bool(forKey: "enabled", default: false) else {
             return nil
         }
         let host = try configReader.requiredString(forKey: "host")
         let type = configReader.string(forKey: "type", default: "http")
-        let authorization = try HTTPClient.Authorization(configReader: configReader.scoped(to: "authorization"))
+        let authenticator = try Self.makeAuthenticator(configReader: configReader.scoped(to: "authorization"))
         let connectHeaders = try Self.parseConnectHeaders(configReader: configReader)
         switch type {
         case "http":
             let port = try configReader.requiredInt(forKey: "port")
-            self = .server(host: host, port: port, authorization: authorization, connectHeaders: connectHeaders)
+            self = .server(host: host, port: port, connectHeaders: connectHeaders)
+            self.authenticator = authenticator
         case "socks":
-            if authorization != nil || !connectHeaders.isEmpty {
+            if authenticator != nil || !connectHeaders.isEmpty {
                 throw HTTPClientError.invalidProxyConfiguration
             }
             let port = configReader.int(forKey: "port", default: 1080)
             self = .socksServer(host: host, port: port)
+        default:
+            throw HTTPClientError.invalidProxyConfiguration
+        }
+    }
+
+    private static func makeAuthenticator(configReader: ConfigReader) throws -> (any HTTPClientAuthenticator)? {
+        guard let scheme = configReader.string(forKey: "scheme") else {
+            return nil
+        }
+        switch scheme {
+        case "basic":
+            if let username = configReader.string(forKey: "username"),
+                let password = configReader.string(forKey: "password")
+            {
+                return BasicAuthenticator(username: username, password: password)
+            } else if let credentials = configReader.string(forKey: "credentials") {
+                return BasicAuthenticator(encodedCredentials: credentials)
+            } else {
+                throw HTTPClientError.invalidProxyConfiguration
+            }
+        case "bearer":
+            guard let token = configReader.string(forKey: "token") else {
+                throw HTTPClientError.invalidProxyConfiguration
+            }
+            return BearerAuthenticator(token: token)
         default:
             throw HTTPClientError.invalidProxyConfiguration
         }
@@ -231,43 +265,5 @@ extension StringProtocol {
             return self[self.endIndex..<self.endIndex]
         }
         return self[start...end]
-    }
-}
-
-@available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-extension HTTPClient.Authorization {
-    /// Initializes HTTP authorization from a ConfigReader.
-    ///
-    /// ## Configuration keys:
-    /// - `scheme` (string, optional): Authorization scheme ("basic" or "bearer"). If absent, the initializer returns `nil`.
-    /// - `username` (string): Username for basic authentication. Required (alongside `password`) when `scheme` is "basic" and `credentials` is not set.
-    /// - `password` (string): Password for basic authentication. Required (alongside `username`) when `scheme` is "basic" and `credentials` is not set.
-    /// - `credentials` (string): Pre-encoded basic credentials. Used when `scheme` is "basic" and `username`/`password` are not both provided.
-    /// - `token` (string): Bearer token. Required when `scheme` is "bearer".
-    ///
-    /// - Throws: `HTTPClientError.invalidProxyConfiguration` if `scheme` is unknown or required keys are missing.
-    public init?(configReader: ConfigReader) throws {
-        guard let scheme = configReader.string(forKey: "scheme") else {
-            return nil
-        }
-        switch scheme {
-        case "basic":
-            if let username = configReader.string(forKey: "username"),
-                let password = configReader.string(forKey: "password")
-            {
-                self = .basic(username: username, password: password)
-            } else if let credentials = configReader.string(forKey: "credentials") {
-                self = .basic(credentials: credentials)
-            } else {
-                throw HTTPClientError.invalidProxyConfiguration
-            }
-        case "bearer":
-            guard let token = configReader.string(forKey: "token") else {
-                throw HTTPClientError.invalidProxyConfiguration
-            }
-            self = .bearer(tokens: token)
-        default:
-            throw HTTPClientError.invalidProxyConfiguration
-        }
     }
 }

@@ -307,6 +307,30 @@ extension Transaction: HTTPExecutableRequest {
             case .produceMore:
                 executer.demandResponseBodyStream(self)
             }
+        case .demandMoreResponseBodyParts(let executor):
+            executor.demandResponseBodyStream(self)
+        case .fail(let failAction):
+            self.performFailAction(failAction)
+        }
+    }
+
+    /// Drops the remainder of the response body instead of forwarding it to the user. A user that is still
+    /// iterating the body sees an error.
+    ///
+    /// This keeps an HTTP/1.1 connection reusable, if a response is no longer of interest. If the remainder of
+    /// the body is larger than `maxBytes`, the request is cancelled instead, which closes the connection.
+    func discardResponseBody(maxBytes: Int, expectedContentLength: Int?) {
+        let action = self.state.withLockedValue { state in
+            state.discardResponseBody(maxBytes: maxBytes, expectedContentLength: expectedContentLength)
+        }
+        switch action {
+        case .none:
+            break
+        case .finishStreamAndDemandMore(let source, let executor):
+            source.finish(HTTPClientError.cancelled)
+            executor.demandResponseBodyStream(self)
+        case .fail(let failAction):
+            self.performFailAction(failAction)
         }
     }
 

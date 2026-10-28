@@ -39,14 +39,19 @@ final class HTTP1Connection {
 
     let id: HTTPConnectionPool.Connection.ID
 
+    /// Information about the TLS session, if the connection is secured by TLS.
+    let tlsInfo: HTTPClient.TLSInfo?
+
     init(
         channel: Channel,
         connectionID: HTTPConnectionPool.Connection.ID,
-        delegate: HTTP1ConnectionDelegate
+        delegate: HTTP1ConnectionDelegate,
+        tlsInfo: HTTPClient.TLSInfo? = nil
     ) {
         self.channel = channel
         self.id = connectionID
         self.delegate = delegate
+        self.tlsInfo = tlsInfo
     }
 
     deinit {
@@ -60,9 +65,15 @@ final class HTTP1Connection {
         connectionID: HTTPConnectionPool.Connection.ID,
         delegate: HTTP1ConnectionDelegate,
         decompression: HTTPClient.Decompression,
+        tlsInfo: HTTPClient.TLSInfo? = nil,
         logger: Logger
     ) throws -> HTTP1Connection {
-        let connection = HTTP1Connection(channel: channel, connectionID: connectionID, delegate: delegate)
+        let connection = HTTP1Connection(
+            channel: channel,
+            connectionID: connectionID,
+            delegate: delegate,
+            tlsInfo: tlsInfo
+        )
         try connection.start(decompression: decompression, logger: logger)
         return connection
     }
@@ -75,12 +86,14 @@ final class HTTP1Connection {
         private let connection: NIOLoopBound<HTTP1Connection>
         let channel: Channel
         let id: HTTPConnectionPool.Connection.ID
+        let tlsInfo: HTTPClient.TLSInfo?
         private var eventLoop: EventLoop { self.connection.eventLoop }
 
         init(_ connection: HTTP1Connection) {
             self.connection = NIOLoopBound(connection, eventLoop: connection.channel.eventLoop)
             self.id = connection.id
             self.channel = connection.channel
+            self.tlsInfo = connection.tlsInfo
         }
 
         func executeRequest(_ request: HTTPExecutableRequest) {

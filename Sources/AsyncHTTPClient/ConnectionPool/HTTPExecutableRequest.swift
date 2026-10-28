@@ -171,6 +171,15 @@ protocol HTTPSchedulableRequest: HTTPExecutableRequest {
 
     /// Fails the queued request, with an error.
     func fail(_ error: Error)
+
+    /// Non-nil if the request asks for a whole connection instead of being executed on one.
+    ///
+    /// See ``ConnectionLeaseRequest``.
+    var connectionLease: ConnectionLeaseRequest? { get }
+}
+
+extension HTTPSchedulableRequest {
+    var connectionLease: ConnectionLeaseRequest? { nil }
 }
 
 /// A handle to the request executor.

@@ -290,6 +290,42 @@ let secureSocketPathBasedURL = URL(
 )
 ```
 
+#### Authentication
+Requests sent with the Swift Concurrency API are authenticated by an ``HTTPClientAuthenticator``. Set one for all
+requests with ``HTTPClient/Configuration/authenticator``, for a single request with
+``HTTPClientRequest/authenticator``, or for an HTTP proxy with ``HTTPClient/Configuration/Proxy/authenticator``:
+```swift
+var request = HTTPClientRequest(url: "https://example.com/protected")
+request.authenticator = BasicAuthenticator(username: "alice", password: "s3cret")
+let response = try await HTTPClient.shared.execute(request, timeout: .seconds(30))
+```
+
+``BasicAuthenticator`` and ``BearerAuthenticator`` are part of AsyncHTTPClient. The `AsyncHTTPClientAuth` library
+adds `Digest`, `NTLM`, `Negotiate` (Kerberos), `SCRAM` and AWS Signature Version 4.
+
+An authenticator may send a request several times with the ``HTTPClientExchange`` it is given, for example to answer
+a challenge. Connection-based schemes pin a connection with ``HTTPClientExchange/pinConnection(with:)``, so that all
+legs of a handshake are sent on the same connection:
+```swift
+struct TokenAuthenticator: HTTPClientAuthenticator {
+    func authenticate(_ request: HTTPClientRequest, exchange: HTTPClientExchange) async throws -> HTTPClientResponse {
+        let response = try await exchange.send(request)
+        guard response.status == exchange.peer.challengeStatus,
+            let challenge = response.authenticationChallenges(for: exchange.peer)
+                .first(where: { $0.matches(scheme: "Token") })
+        else {
+            return response
+        }
+        var retry = request
+        retry.headers.replaceOrAdd(
+            name: exchange.peer.credentialsHeaderName,
+            value: "Token \(makeToken(for: challenge))"
+        )
+        return try await exchange.send(retry)
+    }
+}
+```
+
 #### Disabling HTTP/2
 The exclusive use of HTTP/1 is possible by setting ``HTTPClient/Configuration/httpVersion-swift.property`` to ``HTTPClient/Configuration/HTTPVersion-swift.struct/http1Only`` on the ``HTTPClient/Configuration``:
 ```swift
@@ -319,6 +355,15 @@ AsyncHTTPClient's security process is documented on [GitHub](https://github.com/
 - ``ResponseAccumulator``
 - ``FileDownloadDelegate``
 - ``HTTPClientCopyingDelegate``
+
+### Authentication
+
+- ``HTTPClientAuthenticator``
+- ``HTTPClientExchange``
+- ``HTTPClientConnection``
+- ``HTTPAuthenticationChallenge``
+- ``BasicAuthenticator``
+- ``BearerAuthenticator``
 
 ### Errors
 

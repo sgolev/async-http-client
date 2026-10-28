@@ -83,14 +83,8 @@ struct HTTPClientConfigurationPropsTests {
 
         #expect(config.maximumUsesPerConnection == 100)
 
-        #expect(
-            config.proxy
-                == .server(
-                    host: "proxy.example.com",
-                    port: 8080,
-                    authorization: .basic(username: "user", password: "pass")
-                )
-        )
+        #expect(config.proxy == .server(host: "proxy.example.com", port: 8080))
+        #expect((config.proxy?.authenticator as? BasicAuthenticator)?.encodedCredentials == "dXNlcjpwYXNz")
     }
 
     @Test
@@ -333,7 +327,7 @@ struct HTTPClientConfigurationPropsTests {
         let config = try HTTPClient.Configuration(configReader: configReader)
 
         #expect(config.proxy == .server(host: "proxy.example.com", port: 8080))
-        #expect(config.proxy?.authorization == nil)
+        #expect(config.proxy?.authenticator == nil)
     }
 
     @Test
@@ -349,10 +343,8 @@ struct HTTPClientConfigurationPropsTests {
         let configReader = ConfigReader(provider: testProvider)
         let config = try HTTPClient.Configuration(configReader: configReader)
 
-        #expect(
-            config.proxy
-                == .server(host: "proxy.example.com", port: 8080, authorization: .basic(credentials: "dXNlcjpwYXNz"))
-        )
+        #expect(config.proxy == .server(host: "proxy.example.com", port: 8080))
+        #expect((config.proxy?.authenticator as? BasicAuthenticator)?.encodedCredentials == "dXNlcjpwYXNz")
     }
 
     @Test
@@ -369,10 +361,8 @@ struct HTTPClientConfigurationPropsTests {
         let configReader = ConfigReader(provider: testProvider)
         let config = try HTTPClient.Configuration(configReader: configReader)
 
-        #expect(
-            config.proxy
-                == .server(host: "proxy.example.com", port: 8080, authorization: .bearer(tokens: "abc123"))
-        )
+        #expect(config.proxy == .server(host: "proxy.example.com", port: 8080))
+        #expect(config.proxy?.authenticator is BearerAuthenticator)
     }
 
     @Test

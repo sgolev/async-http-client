@@ -64,7 +64,7 @@ extension HTTPConnectionPool {
                         eventLoopGroup: self.eventLoopGroup,
                         sslContextCache: self.sslContextCache,
                         tlsConfiguration: request.tlsConfiguration,
-                        clientConfiguration: self.configuration,
+                        clientConfiguration: Self.configuration(self.configuration, for: poolKey),
                         key: poolKey,
                         delegate: self,
                         idGenerator: self.connectionIDGenerator,
@@ -84,6 +84,22 @@ extension HTTPConnectionPool {
             case .failure(let error):
                 request.fail(error)
             }
+        }
+
+        /// Pools that serve pinned connections only ever speak HTTP/1.1, since connection based authentication
+        /// is not possible on a multiplexed HTTP/2 connection. They also never pre-warm connections, as there
+        /// would otherwise be pre-warmed connections for every authentication identity.
+        private static func configuration(
+            _ configuration: HTTPClient.Configuration,
+            for key: Key
+        ) -> HTTPClient.Configuration {
+            guard key.pinning != nil else {
+                return configuration
+            }
+            var configuration = configuration
+            configuration.httpVersion = .http1Only
+            configuration.connectionPool.preWarmedHTTP1ConnectionCount = 0
+            return configuration
         }
 
         /// Shutdown the connection pool manager. You **must** shutdown the pool manager, since it leak otherwise.

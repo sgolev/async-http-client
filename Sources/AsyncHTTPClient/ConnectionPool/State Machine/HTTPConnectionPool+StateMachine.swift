@@ -357,10 +357,10 @@ extension HTTPConnectionPool {
             )
         }
 
-        mutating func http1ConnectionReleased(_ connectionID: Connection.ID) -> Action {
+        mutating func http1ConnectionReleased(_ connectionID: Connection.ID, additionalUses: Int = 0) -> Action {
             self.state.modify(
                 http1: { http1 in
-                    http1.http1ConnectionReleased(connectionID)
+                    http1.http1ConnectionReleased(connectionID, additionalUses: additionalUses)
                 },
                 http2: { http2 in
                     http2.http1ConnectionReleased(connectionID)

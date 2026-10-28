@@ -163,6 +163,10 @@ extension HTTPClientRequest {
         newRequest.body = body
         newRequest.localAddress = self.localAddress
         newRequest.tlsConfiguration = self.tlsConfiguration
+        if originalURL.hasTheSameOrigin(as: redirectURL) {
+            // Like the `Authorization` header, a request's authenticator must not leak to other origins.
+            newRequest.authenticator = self.authenticator
+        }
         return newRequest
     }
 }

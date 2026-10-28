@@ -33,6 +33,8 @@ final class HTTPConnectionPool:
     private var _backoffTimer = [Connection.ID: Scheduled<Void>]()
     /// The request connection timeout timers. Protected by the stateLock
     private var _requestTimer = [Request.ID: Scheduled<Void>]()
+    /// The connections that are pinned by an `HTTPClientExchange`. Protected by the stateLock
+    private var _pins: PinnedConnections
 
     private static let fallbackConnectTimeout: TimeAmount = .seconds(30)
 
@@ -72,6 +74,7 @@ final class HTTPConnectionPool:
         self.logger = logger
 
         self.idleConnectionTimeout = clientConfiguration.connectionPool.idleTimeout
+        self._pins = PinnedConnections(closeAuthenticatedConnectionsOnRelease: key.pinning == .anonymous)
 
         self._state = StateMachine(
             idGenerator: idGenerator,
@@ -90,7 +93,10 @@ final class HTTPConnectionPool:
 
     func shutdown() {
         self.logger.debug("Shutting down connection pool")
-        self.modifyStateAndRunActions { $0.shutdown() }
+        self.modifyStateAndPinsAndRunActions { stateMachine, pins in
+            pins.shutdown()
+            return (stateMachine.shutdown(), .none)
+        }
     }
 
     // MARK: - Private Methods -
@@ -130,6 +136,7 @@ final class HTTPConnectionPool:
         enum RequestAction {
             enum Unlocked {
                 case executeRequest(Request, Connection)
+                case grantLease(ConnectionLeaseRequest, Connection)
                 case executeRequests([Request], Connection)
                 case failRequest(Request, Error)
                 case failRequests([Request], Error)
@@ -144,29 +151,47 @@ final class HTTPConnectionPool:
             }
         }
 
+        enum PinAction {
+            case execute(Request, Connection)
+            case close(Connection)
+            case fail([Request], Error)
+            case none
+        }
+
         struct Locked {
             var connection: ConnectionAction.Locked
             var request: RequestAction.Locked
+            /// A connection that was leased for a ``ConnectionLeaseRequest`` and must be pinned.
+            var pinConnection: Connection?
         }
 
         struct Unlocked {
             var connection: ConnectionAction.Unlocked
             var request: RequestAction.Unlocked
+            var pin: PinAction
         }
 
         var locked: Locked
         var unlocked: Unlocked
 
-        init(from stateMachineAction: StateMachine.Action) {
-            self.locked = Locked(connection: .none, request: .none)
-            self.unlocked = Unlocked(connection: .none, request: .none)
+        init(from stateMachineAction: StateMachine.Action, pinAction: PinAction = .none) {
+            self.locked = Locked(connection: .none, request: .none, pinConnection: nil)
+            self.unlocked = Unlocked(connection: .none, request: .none, pin: pinAction)
 
             switch stateMachineAction.request {
             case .executeRequest(let request, let connection, let cancelTimeout):
                 if cancelTimeout {
                     self.locked.request = .cancelRequestTimeout(request.id)
                 }
-                self.unlocked.request = .executeRequest(request, connection)
+                if let lease = request.req.connectionLease {
+                    // The connection must be pinned in the same critical section in which the state machine
+                    // leased it. Otherwise a close event might slip in between and would never be seen by
+                    // the exchange.
+                    self.locked.pinConnection = connection
+                    self.unlocked.request = .grantLease(lease, connection)
+                } else {
+                    self.unlocked.request = .executeRequest(request, connection)
+                }
             case .executeRequestsAndCancelTimeouts(let requests, let connection):
                 self.locked.request = .cancelRequestTimeouts(requests)
                 self.unlocked.request = .executeRequests(requests, connection)
@@ -236,11 +261,22 @@ final class HTTPConnectionPool:
     // MARK: Run actions
 
     private func modifyStateAndRunActions(_ closure: (inout StateMachine) -> StateMachine.Action) {
+        self.modifyStateAndPinsAndRunActions { stateMachine, _ in
+            (closure(&stateMachine), .none)
+        }
+    }
+
+    private func modifyStateAndPinsAndRunActions(
+        _ closure: (inout StateMachine, inout PinnedConnections) -> (StateMachine.Action, Actions.PinAction)
+    ) {
         let unlockedActions = self.stateLock.withLock { () -> Actions.Unlocked in
-            let stateMachineAction = closure(&self._state)
-            let poolAction = Actions(from: stateMachineAction)
+            let (stateMachineAction, pinAction) = closure(&self._state, &self._pins)
+            let poolAction = Actions(from: stateMachineAction, pinAction: pinAction)
             self.runLockedConnectionAction(poolAction.locked.connection)
             self.runLockedRequestAction(poolAction.locked.request)
+            if let connection = poolAction.locked.pinConnection {
+                self._pins.register(connection)
+            }
             return poolAction.unlocked
         }
         self.runUnlockedActions(unlockedActions)
@@ -286,6 +322,26 @@ final class HTTPConnectionPool:
     private func runUnlockedActions(_ actions: Actions.Unlocked) {
         self.runUnlockedConnectionAction(actions.connection)
         self.runUnlockedRequestAction(actions.request)
+        self.runUnlockedPinAction(actions.pin)
+    }
+
+    private func runUnlockedPinAction(_ action: Actions.PinAction) {
+        switch action {
+        case .execute(let request, let connection):
+            connection.executeRequest(request.req)
+        case .close(let connection):
+            self.logger.trace(
+                "closing authenticated connection that was pinned without identity",
+                metadata: [
+                    "ahc-connection-id": "\(connection.id)"
+                ]
+            )
+            connection.close(promise: nil)
+        case .fail(let requests, let error):
+            for request in requests { request.req.fail(error) }
+        case .none:
+            break
+        }
     }
 
     private func runUnlockedConnectionAction(_ action: Actions.ConnectionAction.Unlocked) {
@@ -361,9 +417,28 @@ final class HTTPConnectionPool:
         case .executeRequest(let request, let connection):
             connection.executeRequest(request.req)
 
+        case .grantLease(let lease, let connection):
+            let isAuthenticated = self.stateLock.withLock { self._pins.isAuthenticated(connection.id) }
+            let handle = PinnedConnectionHandle(
+                pool: self,
+                connectionID: connection.id,
+                tlsInfo: connection.tlsInfo,
+                isAuthenticated: isAuthenticated
+            )
+            if !lease.succeed(handle) {
+                // The lease was cancelled in the meantime.
+                self.unpin(connection.id)
+            }
+
         case .executeRequests(let requests, let connection):
             for request in requests {
-                connection.executeRequest(request.req)
+                if let lease = request.req.connectionLease {
+                    // Pinned pools are HTTP/1.1 only. Leases can therefore never end up on an HTTP/2
+                    // connection.
+                    lease.fail(HTTPClientError.invalidExchangeUse)
+                } else {
+                    connection.executeRequest(request.req)
+                }
             }
 
         case .failRequest(let request, let error):
@@ -562,8 +637,9 @@ extension HTTPConnectionPool: HTTP1ConnectionDelegate {
                 "ahc-http-version": "http/1.1",
             ]
         )
-        self.modifyStateAndRunActions {
-            $0.http1ConnectionClosed(id)
+        self.modifyStateAndPinsAndRunActions { stateMachine, pins in
+            let (waitingRequests, error) = pins.connectionClosed(id)
+            return (stateMachine.http1ConnectionClosed(id), .fail(waitingRequests, error))
         }
     }
 
@@ -575,8 +651,8 @@ extension HTTPConnectionPool: HTTP1ConnectionDelegate {
                 "ahc-http-version": "http/1.1",
             ]
         )
-        self.modifyStateAndRunActions {
-            $0.http1ConnectionReleased(id)
+        self.modifyStateAndPinsAndRunActions { stateMachine, pins in
+            Self.handle(pins.connectionReleased(id), for: id, stateMachine: &stateMachine)
         }
     }
 }
@@ -639,8 +715,77 @@ extension HTTPConnectionPool: HTTP2ConnectionDelegate {
 extension HTTPConnectionPool: HTTPRequestScheduler {
     func cancelRequest(_ request: HTTPSchedulableRequest) {
         let requestID = Request(request).id
-        self.modifyStateAndRunActions {
-            $0.cancelRequest(requestID)
+        self.modifyStateAndPinsAndRunActions { stateMachine, pins in
+            if let request = pins.cancelQueuedRequest(requestID) {
+                return (.none, .fail([request], HTTPClientError.cancelled))
+            }
+            return (stateMachine.cancelRequest(requestID), .none)
+        }
+    }
+}
+
+// MARK: - Pinned connections -
+
+extension HTTPConnectionPool {
+    /// Sends a request on a connection that was pinned with a ``ConnectionLeaseRequest``. If the connection is
+    /// currently busy, the request waits for it.
+    func executeOnPinnedConnection(_ request: HTTPSchedulableRequest, connectionID: Connection.ID) {
+        let action = self.stateLock.withLock { () -> PinnedConnections.ExecuteAction in
+            let action = self._pins.execute(Request(request), on: connectionID)
+            if case .queue = action {
+                // Allows cancelling the request while it waits. See ``cancelRequest(_:)``.
+                request.requestWasQueued(self)
+            }
+            return action
+        }
+        switch action {
+        case .execute(let request, let connection):
+            connection.executeRequest(request.req)
+        case .queue:
+            break
+        case .fail(let request, let error):
+            request.req.fail(error)
+        }
+    }
+
+    /// Hands a pinned connection back to the pool. If a request is still running on it, this happens once it
+    /// has finished.
+    func unpin(_ connectionID: Connection.ID) {
+        self.modifyStateAndPinsAndRunActions { stateMachine, pins in
+            Self.handle(pins.unpin(connectionID), for: connectionID, stateMachine: &stateMachine)
+        }
+    }
+
+    func markPinnedConnectionAuthenticated(_ connectionID: Connection.ID) {
+        self.stateLock.withLock {
+            self._pins.markAuthenticated(connectionID)
+        }
+    }
+
+    func pinnedConnectionState(_ connectionID: Connection.ID) -> (isPinned: Bool, isAuthenticated: Bool) {
+        self.stateLock.withLock {
+            (self._pins.isPinned(connectionID), self._pins.isAuthenticated(connectionID))
+        }
+    }
+
+    private static func handle(
+        _ releaseAction: PinnedConnections.ReleaseAction,
+        for connectionID: Connection.ID,
+        stateMachine: inout StateMachine
+    ) -> (StateMachine.Action, Actions.PinAction) {
+        switch releaseAction {
+        case .notPinned:
+            return (stateMachine.http1ConnectionReleased(connectionID), .none)
+        case .forwardRelease(let additionalUses):
+            return (stateMachine.http1ConnectionReleased(connectionID, additionalUses: additionalUses), .none)
+        case .execute(let request, let connection):
+            return (.none, .execute(request, connection))
+        case .close(let connection):
+            // The state machine still considers the connection leased. It learns about the close through
+            // `http1ConnectionClosed`.
+            return (.none, .close(connection))
+        case .none:
+            return (.none, .none)
         }
     }
 }
@@ -677,6 +822,15 @@ extension HTTPConnectionPool {
                 return connection.id
             case .__testOnly_connection(let id, _):
                 return id
+            }
+        }
+
+        var tlsInfo: HTTPClient.TLSInfo? {
+            switch self._ref {
+            case .http1_1(let connection):
+                return connection.tlsInfo
+            case .http2, .__testOnly_connection:
+                return nil
             }
         }
 

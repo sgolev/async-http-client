@@ -32,7 +32,8 @@ let strictConcurrencySettings: [SwiftSetting] = {
 let package = Package(
     name: "async-http-client",
     products: [
-        .library(name: "AsyncHTTPClient", targets: ["AsyncHTTPClient"])
+        .library(name: "AsyncHTTPClient", targets: ["AsyncHTTPClient"]),
+        .library(name: "AsyncHTTPClientAuth", targets: ["AsyncHTTPClientAuth"]),
     ],
     traits: [
         .default(enabledTraits: []),
@@ -41,6 +42,14 @@ let package = Package(
             description: """
                 Enables source unstable SPIs to support the swift-http-api-proposal
                 AHC backend. Do not rely on this module in API stable packages.
+                """
+        ),
+        .trait(
+            name: "GSSAPI",
+            description: """
+                Enables the GSS-API based Negotiate (Kerberos) provider of AsyncHTTPClientAuth on Linux.
+                Requires the MIT Kerberos development headers (e.g. libkrb5-dev or krb5-devel).
+                On Apple platforms GSS.framework is always used.
                 """
         ),
     ],
@@ -57,6 +66,10 @@ let package = Package(
         // Disable all traits to prevent linking Foundation
         .package(url: "https://github.com/apple/swift-configuration.git", from: "1.0.0", traits: []),
         .package(url: "https://github.com/apple/swift-service-context.git", from: "1.1.0"),
+        // Used by AsyncHTTPClientAuth only
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.12.3"..<"6.0.0"),
+        .package(url: "https://github.com/apple/swift-certificates.git", from: "1.0.0"),
+        .package(url: "https://github.com/apple/swift-asn1.git", from: "1.0.0"),
     ],
     targets: [
         .target(
@@ -91,6 +104,44 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "Tracing", package: "swift-distributed-tracing"),
                 .product(name: "ServiceContextModule", package: "swift-service-context"),
+            ],
+            swiftSettings: strictConcurrencySettings
+        ),
+        .target(
+            name: "CAsyncHTTPClientGSSAPI",
+            linkerSettings: [
+                .linkedLibrary("gssapi_krb5", .when(platforms: [.linux]))
+            ]
+        ),
+        .target(
+            name: "AsyncHTTPClientAuth",
+            dependencies: [
+                .target(name: "AsyncHTTPClient"),
+                .target(name: "CAsyncHTTPClientGSSAPI", condition: .when(platforms: [.linux], traits: ["GSSAPI"])),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "_CryptoExtras", package: "swift-crypto"),
+                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
+            ],
+            swiftSettings: strictConcurrencySettings
+        ),
+        .testTarget(
+            name: "AsyncHTTPClientAuthTests",
+            dependencies: [
+                .target(name: "AsyncHTTPClientAuth"),
+                .target(name: "AsyncHTTPClient"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOConcurrencyHelpers", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "X509", package: "swift-certificates"),
+                .product(name: "SwiftASN1", package: "swift-asn1"),
             ],
             swiftSettings: strictConcurrencySettings
         ),
